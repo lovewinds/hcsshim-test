@@ -77,6 +77,21 @@ func (v *VM) Shutdown() error {
 	return nil
 }
 
+// Kill opens a VM by ID and forcibly terminates it, then closes the handle.
+// It returns an error if the VM cannot be found or terminated.
+func Kill(id string) error {
+	system, err := vmcompute.HcsOpenComputeSystem(id)
+	if err != nil {
+		return fmt.Errorf("open VM %q: %w", id, err)
+	}
+	log.Printf("[vmrunner] killing VM %q", id)
+	if err := vmcompute.HcsTerminateComputeSystem(system, ""); err != nil {
+		_ = vmcompute.HcsCloseComputeSystem(system)
+		return fmt.Errorf("terminate VM %q: %w", id, err)
+	}
+	return vmcompute.HcsCloseComputeSystem(system)
+}
+
 // cleanup opens and terminates an existing VM with the given ID, then closes its handle.
 func cleanup(id string) error {
 	system, err := vmcompute.HcsOpenComputeSystem(id)

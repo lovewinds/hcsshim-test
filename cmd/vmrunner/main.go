@@ -23,8 +23,18 @@ func main() {
 		kernelArgs  = flag.String("kernel-args", "", "Override kernel command line")
 		vmID        = flag.String("id", "vmrunner-vm", "VM identifier")
 		debug       = flag.Bool("debug", false, "Print HCS JSON config before creating VM")
+		kill        = flag.String("kill", "", "Terminate a running VM by ID and exit")
 	)
 	flag.Parse()
+
+	// Handle -kill before starting a new VM.
+	if *kill != "" {
+		if err := vm.Kill(*kill); err != nil {
+			log.Fatalf("failed to kill VM %q: %v", *kill, err)
+		}
+		log.Printf("[vmrunner] VM %q terminated", *kill)
+		return
+	}
 
 	args := flag.Args()
 

@@ -96,14 +96,28 @@ func hresultError(hr uintptr, detail string) error {
 	}
 }
 
-// --- Async wait helper ---
+// --- Async wait helpers ---
 
-// waitForSystemNotification registers a one-shot callback on system, waits for
-// the specified notification type, then unregisters. Call this AFTER the HCS
-// function returns HCS_OPERATION_PENDING with a valid (non-zero) system handle.
+// notificationWaiter registers a callback on a compute system handle BEFORE the
+// HCS operation is called, so that notifications fired during or immediately
+// after the call are never lost.
+//
+// Usage:
+//
+//	waiter, err := newNotificationWaiter(system, hcsNotificationSystemStartCompleted)
+//	defer waiter.Close()
+//	// … call HCS function …
+//	if hr == errOperationPending { return waiter.Wait(120 * time.Second) }
+type notificationWaiter struct {
+	ch             chan error
+	callbackHandle uintptr
+}
+
+// newNotificationWaiter creates a notificationWaiter that listens for want on
+// system. Call this BEFORE the HCS operation to avoid race conditions.
 //
 // Windows amd64 uses a single calling convention, so syscall.NewCallback works.
-func waitForSystemNotification(system HcsSystem, want hcsNotificationType, timeout time.Duration) error {
+func newNotificationWaiter(system HcsSystem, want hcsNotificationType) (*notificationWaiter, error) {
 	ch := make(chan error, 1)
 
 	cb := syscall.NewCallback(func(notType, _ /*ctx*/, status, data uintptr) uintptr {
@@ -132,16 +146,39 @@ func waitForSystemNotification(system HcsSystem, want hcsNotificationType, timeo
 		uintptr(unsafe.Pointer(&callbackHandle)),
 	)
 	if hr != 0 {
-		return hresultError(hr, "HcsRegisterComputeSystemCallback")
+		return nil, hresultError(hr, "HcsRegisterComputeSystemCallback")
 	}
-	defer procHcsUnregisterComputeSystemCallback.Call(callbackHandle)
+	return &notificationWaiter{ch: ch, callbackHandle: callbackHandle}, nil
+}
 
+// Wait blocks until the notification arrives or the timeout expires.
+func (w *notificationWaiter) Wait(timeout time.Duration) error {
 	select {
-	case err := <-ch:
+	case err := <-w.ch:
 		return err
 	case <-time.After(timeout):
-		return fmt.Errorf("timeout after %s waiting for HCS notification 0x%X", timeout, uint32(want))
+		return fmt.Errorf("timeout after %s waiting for HCS notification", timeout)
 	}
+}
+
+// Close unregisters the callback. Safe to call via defer.
+func (w *notificationWaiter) Close() {
+	procHcsUnregisterComputeSystemCallback.Call(w.callbackHandle)
+}
+
+// waitForSystemNotification registers a one-shot callback on system, waits for
+// the specified notification type, then unregisters. Call this AFTER the HCS
+// function returns HCS_OPERATION_PENDING with a valid (non-zero) system handle.
+//
+// Used only for HcsCreateComputeSystem, where the handle is not available until
+// after the call returns, making pre-registration impossible.
+func waitForSystemNotification(system HcsSystem, want hcsNotificationType, timeout time.Duration) error {
+	w, err := newNotificationWaiter(system, want)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	return w.Wait(timeout)
 }
 
 // --- Public HCS API ---
@@ -212,9 +249,16 @@ func HcsOpenComputeSystem(id string) (HcsSystem, error) {
 //
 // Old API: HcsStartComputeSystem(System, Options, *Result)
 func HcsStartComputeSystem(system HcsSystem, options string) error {
+	// Register the callback BEFORE calling HCS to avoid missing a notification
+	// that fires before we have a chance to register (race condition).
+	waiter, err := newNotificationWaiter(system, hcsNotificationSystemStartCompleted)
+	if err != nil {
+		return fmt.Errorf("register start callback: %w", err)
+	}
+	defer waiter.Close()
+
 	var optionsPtr *uint16
 	if options != "" {
-		var err error
 		optionsPtr, err = syscall.UTF16PtrFromString(options)
 		if err != nil {
 			return err
@@ -234,7 +278,7 @@ func HcsStartComputeSystem(system HcsSystem, options string) error {
 		return hresultError(hr, detail)
 	}
 	if hr == errOperationPending {
-		return waitForSystemNotification(system, hcsNotificationSystemStartCompleted, 120*time.Second)
+		return waiter.Wait(120 * time.Second)
 	}
 	return nil
 }
@@ -243,9 +287,14 @@ func HcsStartComputeSystem(system HcsSystem, options string) error {
 //
 // Old API: HcsShutdownComputeSystem(System, Options, *Result)
 func HcsShutdownComputeSystem(system HcsSystem, options string) error {
+	waiter, err := newNotificationWaiter(system, hcsNotificationSystemExited)
+	if err != nil {
+		return fmt.Errorf("register shutdown callback: %w", err)
+	}
+	defer waiter.Close()
+
 	var optionsPtr *uint16
 	if options != "" {
-		var err error
 		optionsPtr, err = syscall.UTF16PtrFromString(options)
 		if err != nil {
 			return err
@@ -265,7 +314,7 @@ func HcsShutdownComputeSystem(system HcsSystem, options string) error {
 		return hresultError(hr, detail)
 	}
 	if hr == errOperationPending {
-		return waitForSystemNotification(system, hcsNotificationSystemExited, 30*time.Second)
+		return waiter.Wait(30 * time.Second)
 	}
 	return nil
 }
@@ -274,9 +323,14 @@ func HcsShutdownComputeSystem(system HcsSystem, options string) error {
 //
 // Old API: HcsTerminateComputeSystem(System, Options, *Result)
 func HcsTerminateComputeSystem(system HcsSystem, options string) error {
+	waiter, err := newNotificationWaiter(system, hcsNotificationSystemExited)
+	if err != nil {
+		return fmt.Errorf("register terminate callback: %w", err)
+	}
+	defer waiter.Close()
+
 	var optionsPtr *uint16
 	if options != "" {
-		var err error
 		optionsPtr, err = syscall.UTF16PtrFromString(options)
 		if err != nil {
 			return err
@@ -296,7 +350,7 @@ func HcsTerminateComputeSystem(system HcsSystem, options string) error {
 		return hresultError(hr, detail)
 	}
 	if hr == errOperationPending {
-		return waitForSystemNotification(system, hcsNotificationSystemExited, 10*time.Second)
+		return waiter.Wait(10 * time.Second)
 	}
 	return nil
 }

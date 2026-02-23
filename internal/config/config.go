@@ -10,12 +10,12 @@ import (
 
 // VMConfig holds user-facing VM configuration options.
 type VMConfig struct {
-	ImageDir    string
-	MemoryMB    uint32
-	CPUCount    uint32
-	KernelArgs  string
-	VMID        string
-	PipeName    string
+	ImageDir   string
+	MemoryMB   uint32
+	CPUCount   uint32
+	KernelArgs string
+	VMID       string
+	PipeName   string
 }
 
 // --- HCS Schema2 JSON structures ---
@@ -73,13 +73,13 @@ type virtualMachine struct {
 }
 
 type hcsDocument struct {
-	Owner         string        `json:"Owner"`
-	SchemaVersion schemaVersion `json:"SchemaVersion"`
+	Owner          string         `json:"Owner"`
+	SchemaVersion  schemaVersion  `json:"SchemaVersion"`
 	VirtualMachine virtualMachine `json:"VirtualMachine"`
 }
 
 // DefaultKernelArgs is the default kernel command line.
-const DefaultKernelArgs = "console=ttyS0 root=/dev/sda rw init=/sbin/init"
+const DefaultKernelArgs = "console=ttyS0 root=/dev/sda1 rw init=/sbin/init"
 
 // BuildJSON constructs the HCS schema2 JSON configuration string for the VM.
 func BuildJSON(cfg VMConfig) (string, error) {
@@ -101,10 +101,10 @@ func BuildJSON(cfg VMConfig) (string, error) {
 	// slashes, so we use a helper that always produces Windows-style paths.
 	kernelPath := winPath(cfg.ImageDir, "vmlinuz")
 	initrdPath := winPath(cfg.ImageDir, "initrd")
-	vhdxPath   := winPath(cfg.ImageDir, "rootfs.vhdx")
+	vhdxPath := winPath(cfg.ImageDir, "rootfs.vhdx")
 
 	doc := hcsDocument{
-		Owner: "vmrunner",
+		Owner:         "vmrunner",
 		SchemaVersion: schemaVersion{Major: 2, Minor: 1},
 		VirtualMachine: virtualMachine{
 			Chipset: chipset{
