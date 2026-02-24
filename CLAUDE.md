@@ -14,14 +14,14 @@ Windows의 `vmcompute.dll` HCS API를 직접 바인딩하여 경량 Linux VM을 
 │   ├── vmlinuz                             # Linux 커널
 │   ├── initrd                              # 초기 램디스크
 │   └── rootfs.vhdx                         # 루트 파일시스템
-├── cmd/vmrunner/main.go                    # CLI 진입점
+├── cmd/vmrunner/main.go                    # CLI 진입점 (서브커맨드 라우팅)
 └── internal/
     ├── vmcompute/
     │   ├── types.go                        # HcsSystem, HcsProcess, HcsProcessInformation
     │   └── vmcompute.go                    # vmcompute.dll syscall 바인딩
     ├── config/config.go                    # HCS schema2 JSON 빌더
     └── vm/
-        ├── vm.go                           # VM 생명주기 (create/start/shutdown)
+        ├── vm.go                           # VM 생명주기 (Start/Shutdown/Attach/Exec 등)
         └── process.go                      # 시리얼 콘솔 + GCS 프로세스 실행
 ```
 
@@ -31,8 +31,8 @@ Windows의 `vmcompute.dll` HCS API를 직접 바인딩하여 경량 Linux VM을 
 
 ```bash
 # WSL2에서 크로스 컴파일 (권장)
-cd /mnt/c/source/hcsshim
-GOOS=windows GOARCH=amd64 go build -o vmrunner.exe ./cmd/vmrunner
+GOOS=windows GOARCH=amd64 go build -o /tmp/vmrunner.exe ./cmd/vmrunner
+# vmrunner.exe가 Windows에서 실행 중이면 WSL 마운트 경로에 쓰기 권한이 없으므로 /tmp 사용
 ```
 
 모든 소스 파일에 `//go:build windows` 태그가 있으므로 Linux에서도 크로스 컴파일 가능.
@@ -42,12 +42,20 @@ GOOS=windows GOARCH=amd64 go build -o vmrunner.exe ./cmd/vmrunner
 ## 실행 (Windows 관리자 권한 필요)
 
 ```powershell
-.\vmrunner.exe -i                          # 인터랙티브 셸
-.\vmrunner.exe ls /                        # 명령 실행 (시리얼 콘솔 폴백)
-.\vmrunner.exe -memory 4096 -cpu 4 -i      # 4GB/4코어
-.\vmrunner.exe -debug -i                   # HCS JSON 출력 후 시작
-.\vmrunner.exe -id my-vm -i               # VM ID 지정
+vmrunner run                        # VM 시작, 백그라운드 유지
+vmrunner run -i                     # VM 시작, 인터랙티브 셸 (종료 시 VM shutdown)
+vmrunner run -memory 4096 -cpu 4 -i # 4GB/4코어 인터랙티브
+vmrunner run -debug -i              # HCS JSON 출력 후 시작
+vmrunner run -id my-vm -i           # VM ID 지정
+vmrunner exec ls -la                # 시리얼 콘솔로 명령 실행 (VM 없으면 자동 시작)
+vmrunner exec -id my-vm cat /etc/os-release
+vmrunner list                       # 실행 중인 VM 목록
+vmrunner attach vmrunner-vm         # 실행 중인 VM 콘솔에 연결
+vmrunner stop   vmrunner-vm         # Graceful shutdown
+vmrunner kill   vmrunner-vm         # 강제 종료
 ```
+
+공통 숨김 플래그: `-trace` (stdin→pipe 바이트 로그 + HCS JSON 출력)
 
 ---
 
@@ -152,14 +160,55 @@ HRESULT 0xC0370103 (설명): HCS 상세 메시지
 
 ---
 
+## 시리얼 콘솔 입력 — 핵심 발견 사항
+
+### 문제: ConPTY + SetConsoleMode + ReadConsole 충돌
+
+Go의 `os.Stdin.Read()`는 내부적으로 Win32 `ReadConsole`을 호출한다.
+Windows Terminal(ConPTY) 환경에서 `SetConsoleMode`를 **단 한 번이라도** 호출하면
+`ReadConsole`이 Enter 이후에도 영원히 블록되는 상태가 된다.
+제거하는 플래그 종류(LINE_INPUT, ECHO_INPUT 등)와 무관하게 동일하게 발생한다.
+
+### 해결: VTI 모드 + ReadFile 직접 호출
+
+`SetConsoleMode`를 호출한 후 **`ReadConsole`(`os.Stdin.Read()`) 대신
+`ReadFile`을 콘솔 HANDLE에 직접 사용**하면 이 문제를 우회할 수 있다.
+
+`prepareRawConsole()` 함수 (`internal/vm/process.go`):
+- `GetConsoleMode`로 현재 모드 저장
+- `SetConsoleMode`로 VTI 모드 설정:
+  - 제거: `ENABLE_LINE_INPUT` (0x0002) — 줄버퍼링 해제, 키 즉시 전달
+  - 제거: `ENABLE_ECHO_INPUT` (0x0004) — 로컬 에코 제거 (이중 에코 방지)
+  - 추가: `ENABLE_VIRTUAL_TERMINAL_INPUT` (0x0200) — ReadFile 전용 VT 시퀀스 모드
+  - 유지: `ENABLE_PROCESSED_INPUT` (0x0001) — Ctrl+C → SIGINT 유지
+- stdin이 콘솔이 아닌 경우(리다이렉트) `GetConsoleMode` 실패 → 자동 폴백
+- 종료 시 `defer restore()`로 원래 모드 복원
+
+`stdinToPipe()` 함수:
+- `isConsole=true`: `syscall.ReadFile(stdinH, ...)` 직접 사용 (ReadConsole 우회)
+- `isConsole=false`: `os.Stdin.Read()` 기존 방식 유지 (리다이렉트 케이스)
+- `\r` → `\n` 변환 유지 (VTI 모드에서 Enter = `\r`)
+
+### 효과
+
+| 항목 | 결과 |
+|---|---|
+| 이중 에코 | 해결 — 로컬 에코 제거, VM echo만 표시 |
+| 문자 단위 즉시 전달 | 해결 — LINE_INPUT 제거 |
+| 방향키, Tab 등 | 동작 — VT 시퀀스로 전달, VM shell line editing 작동 |
+| Ctrl+C | 동작 유지 — PROCESSED_INPUT 유지, SIGINT 생성 |
+| stdin 리다이렉트 | 자동 폴백, 기존 동작 유지 |
+
+---
+
 ## 프로세스 실행 전략
 
 1. **GCS 경로** (`HcsCreateProcess`): initrd에 GCS 에이전트가 있어야 동작.
    stdio 핸들이 0이면 즉시 시리얼 콘솔로 폴백.
-2. **시리얼 콘솔 폴백** (`\\.\pipe\{vmID}-console`):
+2. **시리얼 콘솔** (`\\.\pipe\{vmID}-console`):
    - 100ms 간격으로 최대 30초 재시도 (VM 시작 후 pipe 생성됨)
-   - 인터랙티브: stdin↔pipe 양방향 복사
-   - 명령 실행: 명령 전송 → 프롬프트(`#`/`$`) 감지로 완료 판단
+   - `InteractiveShell`: stdin↔pipe 양방향, VTI raw 모드
+   - `RunCommand`: 명령 전송 → 프롬프트(`#`/`$`) 감지로 완료 판단
 
 ---
 
