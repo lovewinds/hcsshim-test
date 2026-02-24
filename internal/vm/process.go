@@ -92,9 +92,10 @@ func (v *VM) RunProcess(args []string) (int, error) {
 // The pipe is opened with FILE_FLAG_OVERLAPPED so that concurrent ReadFile and
 // WriteFile on the same handle do not serialize.
 //
-// WARNING: Do not call SetConsoleMode on stdin here. In Windows Terminal (ConPTY),
-// any SetConsoleMode call causes os.Stdin.Read() to block indefinitely regardless
-// of which flags are changed. Cooked mode (default) must be preserved.
+// Console mode is switched to raw VTI inside stdinToPipe via prepareRawConsole.
+// ReadFile is used directly on the console HANDLE (not os.Stdin.Read / ReadConsole)
+// to avoid the ConPTY/Windows Terminal bug where SetConsoleMode causes indefinite
+// blocking when going through the ReadConsole path.
 func (v *VM) InteractiveShell(pipeName string) error {
 	h, err := openOverlappedPipeWithRetry(pipeName, 30*time.Second)
 	if err != nil {
@@ -150,6 +151,8 @@ var (
 	procCreateFileW         = kernel32.NewProc("CreateFileW")
 	procCreateEventW        = kernel32.NewProc("CreateEventW")
 	procGetOverlappedResult = kernel32.NewProc("GetOverlappedResult")
+	procGetConsoleMode      = kernel32.NewProc("GetConsoleMode")
+	procSetConsoleMode      = kernel32.NewProc("SetConsoleMode")
 )
 
 const (
@@ -157,6 +160,11 @@ const (
 	openExisting        = 3
 	fileAttributeNormal = 0x80
 	fileFlagOverlapped  = 0x40000000
+
+	enableProcessedInput   = 0x0001 // keep Ctrl+C → SIGINT
+	enableLineInput        = 0x0002 // line-buffering (remove for char-at-a-time)
+	enableEchoInput        = 0x0004 // local echo (remove to prevent double echo)
+	enableVirtualTermInput = 0x0200 // VTI mode: ReadFile returns VT sequences
 )
 
 // openOverlappedPipe opens a named pipe with FILE_FLAG_OVERLAPPED so that
@@ -285,8 +293,36 @@ func pipeToStdout(h syscall.Handle) error {
 	}
 }
 
+// prepareRawConsole puts the Windows console stdin handle into raw VTI mode
+// (no local echo, no line buffering) and returns the raw HANDLE, a restore
+// function, and whether stdin is actually a console.
+//
+// ENABLE_PROCESSED_INPUT is kept so Ctrl+C continues to generate SIGINT.
+// ReadFile on the returned handle bypasses ReadConsole, avoiding the
+// ConPTY / Windows Terminal bug where SetConsoleMode causes indefinite blocking.
+func prepareRawConsole() (h syscall.Handle, restore func(), isConsole bool) {
+	stdinH, err := syscall.GetStdHandle(syscall.STD_INPUT_HANDLE)
+	if err != nil {
+		return syscall.InvalidHandle, nil, false
+	}
+	var old uint32
+	r, _, _ := procGetConsoleMode.Call(uintptr(stdinH), uintptr(unsafe.Pointer(&old)))
+	if r == 0 {
+		// stdin is not a console (redirected pipe, file, etc.)
+		return syscall.InvalidHandle, nil, false
+	}
+	newMode := (old &^ (enableLineInput | enableEchoInput)) | enableVirtualTermInput
+	procSetConsoleMode.Call(uintptr(stdinH), uintptr(newMode))
+	return stdinH, func() { procSetConsoleMode.Call(uintptr(stdinH), uintptr(old)) }, true
+}
+
 // stdinToPipe reads from stdin and writes to h using overlapped I/O.
 // CR (\r) and CRLF (\r\n) are converted to LF (\n) for the Linux tty.
+//
+// When stdin is a Windows console, the console is put into raw VTI mode
+// (no local echo, no line buffering) and ReadFile is used directly on the
+// console handle. This bypasses the ReadConsole path that causes indefinite
+// blocking under ConPTY/Windows Terminal after any SetConsoleMode call.
 func stdinToPipe(h syscall.Handle) error {
 	ev, err := createEvent()
 	if err != nil {
@@ -294,13 +330,29 @@ func stdinToPipe(h syscall.Handle) error {
 	}
 	defer syscall.CloseHandle(ev)
 
+	// Switch the console to raw VTI mode (removes local echo and line
+	// buffering). Falls back gracefully when stdin is redirected.
+	stdinH, restore, isConsole := prepareRawConsole()
+	if restore != nil {
+		defer restore()
+	}
+
 	inBuf  := make([]byte, 256)
 	outBuf := make([]byte, 0, 256)
 	prevCR := false
 
 	for {
-		n, err := os.Stdin.Read(inBuf)
-		if n > 0 {
+		var n uint32
+		var readErr error
+		if isConsole {
+			// Use ReadFile directly on the console HANDLE so we bypass
+			// ReadConsole — which hangs in ConPTY after SetConsoleMode.
+			readErr = syscall.ReadFile(stdinH, inBuf, &n, nil)
+		} else {
+			nn, e := os.Stdin.Read(inBuf)
+			n, readErr = uint32(nn), e
+		}
+		if int(n) > 0 {
 			outBuf = outBuf[:0]
 			for _, b := range inBuf[:n] {
 				switch {
@@ -340,11 +392,11 @@ func stdinToPipe(h syscall.Handle) error {
 				}
 			}
 		}
-		if err != nil {
-			if err == io.EOF {
+		if readErr != nil {
+			if readErr == io.EOF {
 				return nil
 			}
-			return err
+			return readErr
 		}
 	}
 }
