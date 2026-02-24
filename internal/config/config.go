@@ -79,8 +79,8 @@ type hcsDocument struct {
 }
 
 // DefaultKernelArgs is the default kernel command line.
-// const DefaultKernelArgs = "console=ttyS0 root=/dev/sda1 rw init=/sbin/init"
-const DefaultKernelArgs = "console=ttyS0 root=/dev/sda1 rw init=/bin/bash"
+const DefaultKernelArgs = "console=ttyS0 root=/dev/sda1 rw init=/sbin/init"
+// const DefaultKernelArgs = "console=ttyS0 root=/dev/sda1 rw init=/bin/bash"
 
 // BuildJSON constructs the HCS schema2 JSON configuration string for the VM.
 func BuildJSON(cfg VMConfig) (string, error) {

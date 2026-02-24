@@ -32,6 +32,9 @@ var (
 	procHcsRegisterComputeSystemCallback   = modVmcompute.NewProc("HcsRegisterComputeSystemCallback")
 	procHcsUnregisterComputeSystemCallback = modVmcompute.NewProc("HcsUnregisterComputeSystemCallback")
 
+	// Enumeration.
+	procHcsEnumerateComputeSystems = modVmcompute.NewProc("HcsEnumerateComputeSystems")
+
 	// Process management.
 	procHcsCreateProcess    = modVmcompute.NewProc("HcsCreateProcess")
 	procHcsCloseProcess     = modVmcompute.NewProc("HcsCloseProcess")
@@ -410,6 +413,43 @@ func HcsTerminateProcess(process HcsProcess) error {
 	detail := ptrToString(result)
 	freeCoTaskMem(result)
 	return hresultError(hr, detail)
+}
+
+// HcsEnumerateComputeSystems returns a JSON array describing all compute systems
+// visible to the caller.
+//
+// Old API: HcsEnumerateComputeSystems(Query PCWSTR, *ComputeSystems PWSTR, *Result PWSTR) HRESULT
+// query is a JSON filter string; empty string returns all systems.
+// Both output strings are allocated by HCS and must be freed with CoTaskMemFree.
+func HcsEnumerateComputeSystems(query string) (string, error) {
+	var queryPtr *uint16
+	if query != "" {
+		var err error
+		queryPtr, err = syscall.UTF16PtrFromString(query)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	var systems *uint16
+	var result *uint16
+
+	hr, _, _ := procHcsEnumerateComputeSystems.Call(
+		uintptr(unsafe.Pointer(queryPtr)),
+		uintptr(unsafe.Pointer(&systems)),
+		uintptr(unsafe.Pointer(&result)),
+	)
+	detail := ptrToString(result)
+	freeCoTaskMem(result)
+
+	if hr != 0 {
+		freeCoTaskMem(systems)
+		return "", hresultError(hr, detail)
+	}
+
+	systemsStr := ptrToString(systems)
+	freeCoTaskMem(systems)
+	return systemsStr, nil
 }
 
 // HcsGetProcessInfo retrieves information about a process.
